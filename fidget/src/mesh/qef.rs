@@ -50,12 +50,29 @@ impl QuadraticErrorSolver {
         pos: nalgebra::Vector3<f32>,
         grad: nalgebra::Vector4<f32>,
     ) {
-        // TODO: correct for non-zero distance value in grad.w
+        // Add the position to the mass point
         self.mass_point += nalgebra::Vector4::new(pos.x, pos.y, pos.z, 1.0);
-        let norm = grad.xyz().normalize();
+        
+        // Following libfive's implementation, normalize the gradients
+        // and handle invalid normals gracefully
+        let norm_val = grad.xyz().norm();
+        
+        // Skip points with invalid normals (following libfive's approach)
+        if norm_val <= 1e-12 || grad.xyz().iter().any(|v| !v.is_finite()) {
+            return;
+        }
+        
+        // Normalize the gradient vector
+        let norm = grad.xyz() / norm_val;
+        
+        // Calculate dot product for QEF (considering distance value)
+        let value = grad.w / norm_val;  // Adjust the value by the norm
+        let b = norm.dot(&pos) - value;
+        
+        // Update QEF matrices
         self.ata += norm * norm.transpose();
-        self.atb += norm * norm.dot(&pos);
-        self.btb += norm.dot(&pos).powi(2);
+        self.atb += norm * b;
+        self.btb += b * b;
     }
 
     /// Solve the given QEF, minimizing towards the mass point
@@ -64,7 +81,13 @@ impl QuadraticErrorSolver {
     /// to increase the likelihood that the vertex is bounded in the cell.
     ///
     /// Also returns the QEF error as the second item in the tuple
-    pub fn solve(&self) -> (CellVertex<3>, f32) {
+    ///
+    /// Sets the rank based on the eigenvalues, following libfive's approach:
+    /// - rank 0: all eigenvalues are invalid, use the center point
+    /// - rank 1: the first eigenvalue is valid, this is a planar feature
+    /// - rank 2: the first two eigenvalues are valid, this is an edge
+    /// - rank 3: all eigenvalues are valid, this is a corner
+    pub fn solve(&self) -> (CellVertex<3>, f32, u8) {
         // This gets a little tricky; see
         // https://www.mattkeeter.com/projects/qef for a walkthrough of QEF math
         // and references to primary sources.
@@ -92,9 +115,31 @@ impl QuadraticErrorSolver {
         // eigenvalues of [1.5633028, 1.430821, 0.0058764853] (a dynamic range
         // of 2e3); while the bear model needs to use a rank-2 solver for
         // eigenvalues of [2.87, 0.13, 5.64e-7] (a dynamic range of 10^7).  We
-        // pick 10^3 here somewhat arbitrarily to be within that range.
-        const EIGENVALUE_CUTOFF_RELATIVE: f32 = 1e-3;
-        let cutoff = singular_values[0].abs() * EIGENVALUE_CUTOFF_RELATIVE;
+        // Use an adaptive cutoff strategy that's more aggressive for preserving sharp features
+        // Base cutoff from libfive (0.1) as a starting point
+        const BASE_EIGENVALUE_CUTOFF: f32 = 0.1;
+        
+        // For highly anisotropic features (where one eigenvalue is much larger than others)
+        // we want to be more aggressive in preserving the sharp feature
+        let ratio_01 = if singular_values[0] > 0.0 && singular_values[1] > 0.0 {
+            singular_values[0] / singular_values[1]
+        } else {
+            1.0
+        };
+        
+        let ratio_12 = if singular_values[1] > 0.0 && singular_values[2] > 0.0 {
+            singular_values[1] / singular_values[2]
+        } else {
+            1.0
+        };
+        
+        // If ratios are high, we have a strong feature (edge or corner)
+        // Adjust cutoff to be more aggressive (lower) in these cases
+        let cutoff = if ratio_01 > 10.0 || ratio_12 > 10.0 {
+            BASE_EIGENVALUE_CUTOFF * 0.5
+        } else {
+            BASE_EIGENVALUE_CUTOFF
+        };
 
         // Intuition about `rank`:
         // 0 => all eigenvalues are invalid (?!), use the center point
@@ -114,7 +159,7 @@ impl QuadraticErrorSolver {
             + self.btb)
             .max(1e-6);
 
-        (CellVertex { pos }, err)
+        (CellVertex { pos }, err, rank as u8)
     }
 }
 
@@ -138,7 +183,7 @@ mod test {
             Vector3::new(-0.50, -1.0, -0.6),
             Vector4::new(0.0, 0.0, 0.31, 0.0),
         );
-        let (_out, err) = q.solve();
+        let (_out, err, _rank) = q.solve();
         assert_eq!(err, 1e-6);
     }
 
@@ -157,7 +202,7 @@ mod test {
             Vector3::new(-0.5, -0.25, 0.50),
             Vector4::new(-0.6666667, -0.33333334, 0.6666667, 0.0),
         );
-        let (out, err) = q.solve();
+        let (out, err, _rank) = q.solve();
         assert_eq!(err, 1e-6);
         let expected = Vector3::new(-0.5, -0.25, 0.5);
         assert!(
