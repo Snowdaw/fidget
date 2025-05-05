@@ -1,3 +1,6 @@
+# Snowdaw Fidget fork
+This fork contains a slightly slower but more accurate meshing algorithm.
+
 # Fidget
 [![» Crate](https://badgen.net/crates/v/fidget)](https://crates.io/crates/fidget)
 [![» Docs](https://badgen.net/badge/api/docs.rs/df3600)](https://docs.rs/fidget/)
